@@ -164,7 +164,5 @@ GITHUB_TOKEN=<your_github_personal_access_token>
 
 ## Team Members
 
-final hackathon submission roster:
-
-- Tanisha Mandavia (Team Leader)
+- Tanisha Mandavia
 - Kushagra Garg
