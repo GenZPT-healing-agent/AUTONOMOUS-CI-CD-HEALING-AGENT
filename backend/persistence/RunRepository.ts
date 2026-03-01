@@ -6,13 +6,13 @@
  */
 
 import type pg from "pg";
-import { query, withTransaction } from "./db";
+import { query, withTransaction } from "./db.js";
 import type {
   AnalysisSummary,
   RunRecord,
   RunResult,
   RunStatus,
-} from "../types/agent";
+} from "../types/agent.js";
 
 /* ── Row shape coming from Postgres ── */
 
@@ -63,7 +63,8 @@ const toRunRecord = (row: RunRow): RunRecord => ({
 
 export const RunRepository = {
   /**
-   * Insert a new run in 'running' status.
+   * Insert a new run in 'queued' status.
+   * The worker will transition to 'running' when it picks up the job.
    * Also inserts the initial status transition.
    */
   async create(record: {
@@ -77,7 +78,7 @@ export const RunRepository = {
     await withTransaction(async (client: pg.PoolClient) => {
       await client.query(
         `INSERT INTO runs (id, repo_url, team_name, leader_name, retry_limit, status, branch_name)
-         VALUES ($1, $2, $3, $4, $5, 'running', $6)`,
+         VALUES ($1, $2, $3, $4, $5, 'queued', $6)`,
         [
           record.id,
           record.repoUrl,
@@ -89,7 +90,7 @@ export const RunRepository = {
       );
       await client.query(
         `INSERT INTO status_transitions (run_id, from_status, to_status, reason)
-         VALUES ($1, NULL, 'running', 'Run created')`,
+         VALUES ($1, NULL, 'queued', 'Run created — awaiting worker pickup')`,
         [record.id],
       );
     });

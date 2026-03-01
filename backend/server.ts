@@ -1,25 +1,22 @@
 import "dotenv/config";
 import cors from "cors";
 import express from "express";
-import { mkdir, writeFile } from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { randomUUID } from "node:crypto";
-import { AGENT_PIPELINE, runAgentGraph } from "./agents/graphAgents";
-import { generateBranchName } from "./services/branch";
-import { RunRepository, closePool, initPool, isPoolReady } from "./persistence";
-import { validateRunPayload } from "./services/validatePayload";
-import type { RunResult } from "./types/agent";
+import { AGENT_PIPELINE } from "./agents/graphAgents.js";
+import { generateBranchName } from "./services/branch.js";
+import {
+  RunRepository,
+  closePool,
+  initPool,
+  isPoolReady,
+} from "./persistence/index.js";
+import { validateRunPayload } from "./services/validatePayload.js";
+import { enqueueRun, remediationQueue } from "./queue/runQueue.js";
+import { remediationWorker } from "./queue/worker.js";
 
 const app = express();
 const port = Number(process.env.PORT ?? 8080);
 const DEFAULT_RETRY_LIMIT = Number(process.env.AGENT_RETRY_LIMIT ?? 5);
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
-const workspaceRoot = path.resolve(__dirname, "..");
-const runsRoot = path.join(workspaceRoot, "runs");
-const publicResultsPath = path.join(workspaceRoot, "public", "results.json");
 
 /* ── CORS — Enterprise-grade, environment-aware configuration ────────────
  *
@@ -117,29 +114,26 @@ const clampRetryLimit = (value: unknown): number => {
   return Math.min(20, Math.max(1, Math.floor(parsed)));
 };
 
-const persistRunResult = async (runId: string, result: unknown) => {
-  const runDir = path.join(runsRoot, runId);
-  await mkdir(runDir, { recursive: true });
-  await writeFile(
-    path.join(runDir, "results.json"),
-    JSON.stringify(result, null, 2),
-    "utf8",
-  );
-  await writeFile(publicResultsPath, JSON.stringify(result, null, 2), "utf8");
-};
-
 app.get("/api/agent/health", async (_req, res) => {
   try {
-    const { query: dbQuery } = await import("./persistence/db");
+    const { query: dbQuery } = await import("./persistence/db.js");
     const { rows } = await dbQuery<{ count: string }>(
       `SELECT count(*) FROM runs WHERE status = 'running'`,
     );
+    const queueCounts = await remediationQueue.getJobCounts();
     res.json({
       status: "ok",
       persistence: "postgres",
       poolReady: isPoolReady(),
       defaultRetryLimit: DEFAULT_RETRY_LIMIT,
       activeRuns: Number(rows[0]?.count ?? 0),
+      queue: {
+        waiting: queueCounts.waiting,
+        active: queueCounts.active,
+        completed: queueCounts.completed,
+        failed: queueCounts.failed,
+        workerRunning: remediationWorker.isRunning(),
+      },
       orchestration: {
         framework: "langgraph",
         mode: "multi-agent",
@@ -167,7 +161,7 @@ app.post("/api/agent/runs", validateRunPayload, async (req, res) => {
   const runId = randomUUID();
   const branchName = generateBranchName(teamName, leaderName);
 
-  // ── Persist the run in Postgres before starting ──
+  // ── Persist the run in Postgres with status 'queued' ──
   await RunRepository.create({
     id: runId,
     repoUrl,
@@ -177,72 +171,19 @@ app.post("/api/agent/runs", validateRunPayload, async (req, res) => {
     branchName,
   });
 
+  // ── Enqueue the job for the BullMQ worker — returns immediately ──
   try {
-    const result = await runAgentGraph({
-      runId,
-      repoUrl,
-      teamName,
-      leaderName,
-      retryLimit,
-    });
-
-    // The orchestration layer already persists intermediate state to Postgres.
-    // Here we just write the final JSON files for backward compatibility.
-    await persistRunResult(runId, result);
-
-    res.status(201).json({ runId, status: "completed", result });
-  } catch (error) {
-    const fallbackResult: RunResult = {
-      executionTime: 0,
-      ciStatus: "failed",
-      failuresCount: 1,
-      fixesCount: 0,
-      commitCount: 0,
-      fixesTable: [],
-      timeline: [
-        {
-          iteration: 1,
-          result: "failed",
-          timestamp: new Date().toISOString(),
-          retryCount: 1,
-          retryLimit,
-        },
-      ],
-      baseScore: 100,
-      speedBonus: 0,
-      efficiencyPenalty: 0,
-      repoUrl,
-      generatedBranchName: generateBranchName(teamName, leaderName),
-      analysisSummary: {
-        totalFiles: 0,
-        dominantLanguage: "Unknown",
-        samplePaths: [],
-        detectedIssues: [],
-      },
-      testResults: {
-        passed: false,
-        exitCode: -1,
-        stdout: "",
-        stderr: error instanceof Error ? error.message : "Unknown run error",
-        durationMs: 0,
-        failedTests: [],
-        errorSummary:
-          error instanceof Error ? error.message : "Unknown run error",
-        executionMethod: "skipped",
-      },
-      projectType: "unknown",
-    };
-
-    const errorMsg =
-      error instanceof Error ? error.message : "Unknown run error";
-
-    await RunRepository.transitionStatus(runId, "failed", errorMsg, {
-      error: errorMsg,
-      finishedAt: new Date().toISOString(),
-    });
-    await persistRunResult(runId, fallbackResult);
-    res.status(500).json({ runId, status: "failed", error: errorMsg });
+    await enqueueRun({ runId, repoUrl, teamName, leaderName, retryLimit });
+  } catch (err) {
+    const errorMsg = err instanceof Error ? err.message : "Queue enqueue failed";
+    console.error(`[server] Failed to enqueue run ${runId}: ${errorMsg}`);
+    await RunRepository.transitionStatus(runId, "failed", errorMsg);
+    res.status(503).json({ runId, status: "failed", error: errorMsg });
+    return;
   }
+
+  // Respond immediately — the worker will process the job asynchronously
+  res.status(202).json({ runId, status: "queued" });
 });
 
 app.get("/api/agent/runs/:runId", async (req, res) => {
@@ -312,6 +253,13 @@ app.post("/api/sandbox/callback", async (req, res) => {
 const gracefulShutdown = async (signal: string) => {
   console.log(`\n[server] ${signal} received — shutting down…`);
   if (server) server.close();
+
+  // Drain the worker: finish active jobs but accept no new ones
+  console.log("[server] Closing BullMQ worker…");
+  await remediationWorker.close();
+  console.log("[server] Closing BullMQ queue…");
+  await remediationQueue.close();
+
   await closePool();
   process.exit(0);
 };

@@ -5,9 +5,9 @@
  * along with the per-iteration timeline that the dashboard renders.
  */
 
-import { query, withTransaction } from "./db";
+import { query, withTransaction } from "./db.js";
 import type pg from "pg";
-import type { FixRow, TimelineEntry } from "../types/agent";
+import type { FixRow, TimelineEntry } from "../types/agent.js";
 
 export const PatchRepository = {
   /**

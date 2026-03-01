@@ -5,8 +5,8 @@
  * as its own row, giving a full audit trail of every test run.
  */
 
-import { query } from "./db";
-import type { TestExecutionResult } from "../types/agent";
+import { query } from "./db.js";
+import type { TestExecutionResult } from "../types/agent.js";
 
 export const TestResultRepository = {
   /**

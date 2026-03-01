@@ -3,21 +3,21 @@ import {
   cloneRepository,
   scanForIssues,
   cleanupWorkspace,
-} from "../services/dockerSandbox";
-import { applyAllPatches } from "../services/patchEngine";
+} from "../services/dockerSandbox.js";
+import { applyAllPatches } from "../services/patchEngine.js";
 import {
   configureGitIdentity,
   createBranch,
   stageAndCommit,
   pushBranch,
-} from "../services/gitService";
-import { generateBranchName } from "../services/branch";
-import { detectProjectType, executeTests } from "../services/testRunner";
+} from "../services/gitService.js";
+import { generateBranchName } from "../services/branch.js";
+import { detectProjectType, executeTests } from "../services/testRunner.js";
 import {
   RunRepository,
   TestResultRepository,
   PatchRepository,
-} from "../persistence";
+} from "../persistence/index.js";
 import type {
   AgentGraphState,
   FixRow,
@@ -25,7 +25,7 @@ import type {
   RunResult,
   TestExecutionResult,
   TimelineEntry,
-} from "../types/agent";
+} from "../types/agent.js";
 
 export const AGENT_PIPELINE = [
   "planner",

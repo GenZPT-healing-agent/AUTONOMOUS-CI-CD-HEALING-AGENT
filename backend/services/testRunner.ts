@@ -12,12 +12,12 @@
 
 import { access, readFile } from "node:fs/promises";
 import path from "node:path";
-import type { ProjectConfig, TestExecutionResult } from "../types/agent";
+import type { ProjectConfig, TestExecutionResult } from "../types/agent.js";
 import {
   isDockerAvailable,
   runInContainer,
   runSubprocess,
-} from "./containerSandbox";
+} from "./containerSandbox.js";
 
 /* ── Constants ── */
 

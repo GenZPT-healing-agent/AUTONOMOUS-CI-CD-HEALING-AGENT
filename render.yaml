@@ -14,16 +14,12 @@ services:
     region: oregon
 
     # ── Build ──
-    # Install ALL dependencies (including devDependencies for type-checking),
-    # then run the backend-specific build step.
-    # Setting NODE_ENV during install ensures tsx (now in dependencies) is
-    # always available, while devDeps are installed only at build time.
-    buildCommand: npm install && npm run build:server
+    # Deterministic CI install from lockfile + explicit backend compilation.
+    buildCommand: npm ci && npm run build:server
 
     # ── Start ──
-    # tsx is a production dependency — it runs TypeScript directly at the
-    # Node.js loader level without a separate compile step.
-    startCommand: npm run start
+    # Start compiled JavaScript only (no runtime TypeScript transpilation).
+    startCommand: npm start
 
     envVars:
       - key: NODE_ENV
@@ -35,6 +31,8 @@ services:
       - key: DATABASE_URL
         sync: false          # must be set manually in Render dashboard
       - key: GITHUB_TOKEN
+        sync: false          # must be set manually in Render dashboard
+      - key: REDIS_URL
         sync: false          # must be set manually in Render dashboard
       - key: AGENT_RETRY_LIMIT
         value: "5"

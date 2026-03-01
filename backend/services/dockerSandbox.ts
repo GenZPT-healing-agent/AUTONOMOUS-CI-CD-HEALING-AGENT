@@ -3,7 +3,11 @@ import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
-import type { AnalysisSummary, BugType, DetectedIssue } from "../types/agent";
+import type {
+  AnalysisSummary,
+  BugType,
+  DetectedIssue,
+} from "../types/agent.js";
 
 const execFileAsync = promisify(execFile);
 

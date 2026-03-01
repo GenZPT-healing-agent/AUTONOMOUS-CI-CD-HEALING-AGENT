@@ -1,6 +1,6 @@
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import type { BugType, DetectedIssue } from "../types/agent";
+import type { BugType, DetectedIssue } from "../types/agent.js";
 
 export interface PatchResult {
   filePath: string;
