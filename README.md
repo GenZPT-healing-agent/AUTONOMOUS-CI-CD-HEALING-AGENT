@@ -9,7 +9,7 @@ AI-driven system that accepts a GitHub repository URL, analyzes source files in 
 
 ## LinkedIn Demo Video URL
 
-- Add your demo video link: `https://www.linkedin.com/posts/kushagra-garg-a84013336_rift2026-hackathonexperience-systemthinking-activity-7430428391641776129-NqYQ?utm_source=social_share_send&utm_medium=android_app&rcm=ACoAAFRdC0QBZfdoyAdAKxiwpnjuSPN79se-QKY&utm_campaign=copy_link`
+- Demo video link: `https://www.linkedin.com/posts/kushagra-garg-a84013336_rift2026-hackathonexperience-systemthinking-activity-7430428391641776129-NqYQ?utm_source=social_share_send&utm_medium=android_app&rcm=ACoAAFRdC0QBZfdoyAdAKxiwpnjuSPN79se-QKY&utm_campaign=copy_link`
 
 ## Architecture Diagram
 
