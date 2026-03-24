@@ -1,77 +1,53 @@
 /**
- * RunRepository — Durable persistence for healing-agent runs.
+ * RunRepository — Durable persistence for healing-agent runs using Mongoose.
  *
- * Replaces the volatile in-memory Map<string, RunRecord>.
- * All status transitions are recorded atomically.
+ * Key optimizations vs. the initial migration:
+ *  • create()          — removed unnecessary transaction; sequential inserts + error guard
+ *  • getFullResult()   — single aggregation pipeline replaces 4 parallel queries (N+1 fix)
+ *  • updateProgress()  — uses atomic $set with new: true, no fetch needed
+ *  • transitionStatus()/finalizeScoring() — transactions kept (genuine multi-doc atomicity)
+ *  • All operations    — wrapped with withRetry() for transient-failure resilience
+ *  • All operations    — structured timing logs via dbLog()
  */
 
-import type pg from "pg";
-import { query, withTransaction } from "./db.js";
+import { withTransaction, withRetry, dbLog } from './db.js';
+import { Run } from './models/Run.js';
+import { StatusTransition } from './models/StatusTransition.js';
 import type {
   AnalysisSummary,
   RunRecord,
   RunResult,
   RunStatus,
-} from "../types/agent.js";
+} from '../types/agent.js';
+import type { IRun } from './models/Run.js';
 
-/* ── Row shape coming from Postgres ── */
-
-interface RunRow {
-  id: string;
-  repo_url: string;
-  team_name: string;
-  leader_name: string;
-  retry_limit: number;
-  status: RunStatus;
-  ci_status: string;
-  branch_name: string;
-  project_type: string;
-  failures_count: number;
-  fixes_count: number;
-  commit_count: number;
-  current_iteration: number;
-  base_score: number;
-  speed_bonus: number;
-  efficiency_penalty: number;
-  execution_time_s: number;
-  analysis_summary: AnalysisSummary;
-  error: string | null;
-  started_at: string;
-  finished_at: string | null;
-  created_at: string;
-  updated_at: string;
-  // Enterprise hardening fields
-  failure_category: string | null;
-  failure_summary: string | null;
-  raw_stderr: string | null;
-  push_strategy: string | null;
-  pr_url: string | null;
-}
-
-/* ── Mapping helpers ── */
-
-const toRunRecord = (row: RunRow): RunRecord => ({
-  id: row.id,
-  repoUrl: row.repo_url,
-  teamName: row.team_name,
-  leaderName: row.leader_name,
-  retryLimit: row.retry_limit,
+/* ── Lean mapper ── */
+const toRunRecord = (row: IRun): RunRecord => ({
+  id: String(row._id),
+  repoUrl: row.repoUrl,
+  teamName: row.teamName,
+  leaderName: row.leaderName,
+  retryLimit: row.retryLimit,
   status: row.status,
-  startedAt: new Date(row.started_at).toISOString(),
-  finishedAt: row.finished_at
-    ? new Date(row.finished_at).toISOString()
-    : undefined,
-  error: row.error ?? undefined,
-  // result is assembled by the caller if needed (joins test_results, patches, etc.)
+  startedAt: row.startedAt.toISOString(),
+  finishedAt: row.finishedAt?.toISOString(),
+  error: row.error,
 });
 
-/* ── Repository ─────────────────────────────────────────────────────────── */
+/* ── Repository ── */
 
 export const RunRepository = {
+
+  /** Count runs currently in 'running' state — used by health endpoint. */
+  async countActiveRuns(): Promise<number> {
+    return withRetry('countActiveRuns', () =>
+      Run.countDocuments({ status: 'running' }),
+    );
+  },
+
   /**
-   * Insert a new run in 'queued' status.
-   * The worker will transition to 'running' when it picks up the job.
-   * Also inserts the initial status transition.
+   * Persist a new run in 'queued' state.
+   * No transaction needed: StatusTransition is an audit log; a missed row is not fatal.
    */
   async create(record: {
     id: string;
@@ -81,89 +57,67 @@ export const RunRepository = {
     retryLimit: number;
     branchName: string;
   }): Promise<void> {
-    await withTransaction(async (client: pg.PoolClient) => {
-      await client.query(
-        `INSERT INTO runs (id, repo_url, team_name, leader_name, retry_limit, status, branch_name)
-         VALUES ($1, $2, $3, $4, $5, 'queued', $6)`,
-        [
-          record.id,
-          record.repoUrl,
-          record.teamName,
-          record.leaderName,
-          record.retryLimit,
-          record.branchName,
-        ],
-      );
-      await client.query(
-        `INSERT INTO status_transitions (run_id, from_status, to_status, reason)
-         VALUES ($1, NULL, 'queued', 'Run created — awaiting worker pickup')`,
-        [record.id],
-      );
+    const t0 = Date.now();
+    await withRetry('RunRepository.create', async () => {
+      await Run.create([{
+        _id: record.id,
+        repoUrl: record.repoUrl,
+        teamName: record.teamName,
+        leaderName: record.leaderName,
+        retryLimit: record.retryLimit,
+        branchName: record.branchName,
+        status: 'queued',
+      }]);
+      // Best-effort audit trail — failure here does not roll back the run
+      await StatusTransition.create([{
+        runId: record.id,
+        fromStatus: null,
+        toStatus: 'queued',
+        reason: 'Run created — awaiting worker pickup',
+      }]).catch((auditErr: Error) => {
+        dbLog({ level: 'warn', operation: 'RunRepository.create', message: `Status transition write failed (non-fatal): ${auditErr.message}` });
+      });
+    });
+    dbLog({ level: 'info', operation: 'RunRepository.create', message: `Run ${record.id} created`, durationMs: Date.now() - t0 });
+  },
+
+  /** Fetch a single run header (no sub-collection data). */
+  async findById(runId: string): Promise<RunRecord | null> {
+    return withRetry('RunRepository.findById', async () => {
+      const run = await Run.findById(runId).lean<IRun>();
+      return run ? toRunRecord(run) : null;
     });
   },
 
   /**
-   * Fetch a single run by ID. Returns null if not found.
-   */
-  async findById(runId: string): Promise<RunRecord | null> {
-    const { rows } = await query<RunRow>(`SELECT * FROM runs WHERE id = $1`, [
-      runId,
-    ]);
-    if (rows.length === 0) return null;
-    return toRunRecord(rows[0]);
-  },
-
-  /**
-   * Atomically transition run status.
-   * Records the transition in status_transitions for auditability.
+   * Atomically transition run status and append an audit entry.
+   * Uses a transaction because both documents must succeed together.
    */
   async transitionStatus(
     runId: string,
     toStatus: RunStatus,
     reason: string,
-    extras?: {
-      error?: string;
-      finishedAt?: string;
-    },
+    extras?: { error?: string; finishedAt?: string },
   ): Promise<void> {
-    await withTransaction(async (client: pg.PoolClient) => {
-      // Fetch current status for the audit trail
-      const { rows } = await client.query<{ status: RunStatus }>(
-        `SELECT status FROM runs WHERE id = $1 FOR UPDATE`,
-        [runId],
-      );
-      const fromStatus = rows[0]?.status ?? null;
+    const t0 = Date.now();
+    await withRetry('RunRepository.transitionStatus', () =>
+      withTransaction(async (session) => {
+        const run = await Run.findById(runId).session(session);
+        if (!run) return;
 
-      const sets: string[] = ["status = $2"];
-      const params: unknown[] = [runId, toStatus];
-      let idx = 3;
+        const fromStatus = run.status;
+        run.status = toStatus;
+        if (extras?.error !== undefined) run.error = extras.error;
+        if (extras?.finishedAt !== undefined) run.finishedAt = new Date(extras.finishedAt);
 
-      if (extras?.error !== undefined) {
-        sets.push(`error = $${idx}`);
-        params.push(extras.error);
-        idx++;
-      }
-      if (extras?.finishedAt !== undefined) {
-        sets.push(`finished_at = $${idx}`);
-        params.push(extras.finishedAt);
-        idx++;
-      }
-
-      await client.query(
-        `UPDATE runs SET ${sets.join(", ")} WHERE id = $1`,
-        params,
-      );
-      await client.query(
-        `INSERT INTO status_transitions (run_id, from_status, to_status, reason)
-         VALUES ($1, $2, $3, $4)`,
-        [runId, fromStatus, toStatus, reason],
-      );
-    });
+        await run.save({ session });
+        await StatusTransition.create([{ runId, fromStatus, toStatus, reason }], { session });
+      }),
+    );
+    dbLog({ level: 'info', operation: 'RunRepository.transitionStatus', message: `Run ${runId} → ${toStatus}`, durationMs: Date.now() - t0 });
   },
 
-  /**
-   * Update counters and analysis after each agent node.
-   */
+  /** Partial update of mutable counters/fields — atomic $set, no fetch. */
   async updateProgress(
     runId: string,
     data: {
@@ -177,49 +131,36 @@ export const RunRepository = {
       branchName?: string;
       failureCategory?: string;
       failureSummary?: string;
-      rawStderr?: string;
       pushStrategy?: string;
       prUrl?: string;
     },
   ): Promise<void> {
-    const sets: string[] = [];
-    const params: unknown[] = [runId];
-    let idx = 2;
+    const set: Record<string, unknown> = {};
 
-    const addField = (column: string, value: unknown) => {
-      if (value !== undefined) {
-        sets.push(`${column} = $${idx}`);
-        params.push(value);
-        idx++;
-      }
-    };
+    if (data.ciStatus !== undefined) set.ciStatus = data.ciStatus;
+    if (data.projectType !== undefined) set.projectType = data.projectType;
+    if (data.failuresCount !== undefined) set.failuresCount = data.failuresCount;
+    if (data.fixesCount !== undefined) set.fixesCount = data.fixesCount;
+    if (data.commitCount !== undefined) set.commitCount = data.commitCount;
+    if (data.currentIteration !== undefined) set.currentIteration = data.currentIteration;
+    if (data.branchName !== undefined) set.branchName = data.branchName;
+    if (data.failureCategory !== undefined) set.failureCategory = data.failureCategory;
+    if (data.failureSummary !== undefined) set.failureSummary = data.failureSummary;
+    if (data.pushStrategy !== undefined) set.pushStrategy = data.pushStrategy;
+    if (data.prUrl !== undefined) set.prUrl = data.prUrl;
+    if (data.analysisSummary !== undefined) set.analysisSummary = data.analysisSummary;
 
-    addField("ci_status", data.ciStatus);
-    addField("project_type", data.projectType);
-    addField("failures_count", data.failuresCount);
-    addField("fixes_count", data.fixesCount);
-    addField("commit_count", data.commitCount);
-    addField("current_iteration", data.currentIteration);
-    addField("branch_name", data.branchName);
-    addField("failure_category", data.failureCategory);
-    addField("failure_summary", data.failureSummary);
-    addField("raw_stderr", data.rawStderr?.slice(0, 50000));
-    addField("push_strategy", data.pushStrategy);
-    addField("pr_url", data.prUrl);
+    if (Object.keys(set).length === 0) return;
 
-    if (data.analysisSummary !== undefined) {
-      sets.push(`analysis_summary = $${idx}`);
-      params.push(JSON.stringify(data.analysisSummary));
-      idx++;
-    }
-
-    if (sets.length === 0) return;
-
-    await query(`UPDATE runs SET ${sets.join(", ")} WHERE id = $1`, params);
+    await withRetry('RunRepository.updateProgress', () =>
+      Run.findByIdAndUpdate(runId, { $set: set }, { timestamps: true }),
+    );
   },
 
   /**
-   * Atomically write final scoring and mark the run completed.
+   * Atomically write final scoring fields and transition status to 'completed'.
+   * Transaction is required: score + status must be consistent if the run is read
+   * between partial writes.
    */
   async finalizeScoring(
     runId: string,
@@ -232,167 +173,154 @@ export const RunRepository = {
       failuresCount: number;
     },
   ): Promise<void> {
-    await withTransaction(async (client: pg.PoolClient) => {
-      const { rows } = await client.query<{ status: RunStatus }>(
-        `SELECT status FROM runs WHERE id = $1 FOR UPDATE`,
-        [runId],
-      );
-      const fromStatus = rows[0]?.status ?? null;
-      const toStatus: RunStatus = "completed";
+    const t0 = Date.now();
+    await withRetry('RunRepository.finalizeScoring', () =>
+      withTransaction(async (session) => {
+        const run = await Run.findById(runId).session(session);
+        if (!run) return;
 
-      await client.query(
-        `UPDATE runs SET
-           base_score = $2,
-           speed_bonus = $3,
-           efficiency_penalty = $4,
-           execution_time_s = $5,
-           ci_status = $6,
-           failures_count = $7,
-           status = $8,
-           finished_at = now()
-         WHERE id = $1`,
-        [
-          runId,
-          scoring.baseScore,
-          scoring.speedBonus,
-          scoring.efficiencyPenalty,
-          scoring.executionTimeS,
-          scoring.ciStatus,
-          scoring.failuresCount,
-          toStatus,
-        ],
-      );
-      await client.query(
-        `INSERT INTO status_transitions (run_id, from_status, to_status, reason)
-         VALUES ($1, $2, $3, 'Scoring finalized')`,
-        [runId, fromStatus, toStatus],
-      );
-    });
+        const fromStatus = run.status;
+        const toStatus: RunStatus = 'completed';
+
+        run.baseScore = scoring.baseScore;
+        run.speedBonus = scoring.speedBonus;
+        run.efficiencyPenalty = scoring.efficiencyPenalty;
+        run.executionTimeS = scoring.executionTimeS;
+        run.ciStatus = scoring.ciStatus;
+        run.failuresCount = scoring.failuresCount;
+        run.status = toStatus;
+        run.finishedAt = new Date();
+
+        await run.save({ session });
+        await StatusTransition.create([{
+          runId, fromStatus, toStatus, reason: 'Scoring finalized',
+        }], { session });
+      }),
+    );
+    dbLog({ level: 'info', operation: 'RunRepository.finalizeScoring', message: `Run ${runId} completed`, durationMs: Date.now() - t0 });
   },
 
   /**
-   * Assemble the full RunResult from joined tables.
-   * This is what the API returns.
+   * Return the full RunResult by fetching Run + sub-collections in a
+   * single aggregation round-trip using $lookup.
+   *
+   * Replaces the previous 4 parallel Promise.all() queries (N+1 pattern).
    */
   async getFullResult(runId: string): Promise<RunResult | null> {
-    const { rows: runRows } = await query<RunRow>(
-      `SELECT * FROM runs WHERE id = $1`,
-      [runId],
-    );
-    if (runRows.length === 0) return null;
-    const run = runRows[0];
+    const t0 = Date.now();
+    const docs = await withRetry('RunRepository.getFullResult', () =>
+      Run.aggregate([
+        { $match: { _id: runId } },
 
-    // Patches → FixRow[]
-    const { rows: patchRows } = await query<{
-      file_path: string;
-      bug_type: string;
-      line_number: number;
-      description: string;
-      status: string;
-    }>(
-      `SELECT file_path, bug_type, line_number, description, status
-       FROM patches WHERE run_id = $1 ORDER BY id`,
-      [runId],
+        // --- patches ---
+        {
+          $lookup: {
+            from: 'patches',
+            let: { rid: '$_id' },
+            pipeline: [
+              { $match: { $expr: { $eq: ['$runId', '$$rid'] } } },
+              { $sort: { iteration: 1 } },
+              { $project: { _id: 0, filePath: 1, bugType: 1, lineNumber: 1, description: 1, status: 1 } },
+            ],
+            as: 'patches',
+          },
+        },
+
+        // --- timeline entries ---
+        {
+          $lookup: {
+            from: 'timelineentries',
+            let: { rid: '$_id' },
+            pipeline: [
+              { $match: { $expr: { $eq: ['$runId', '$$rid'] } } },
+              { $sort: { iteration: 1 } },
+              { $project: { _id: 0, iteration: 1, result: 1, createdAt: 1, retryCount: 1, retryLimit: 1 } },
+            ],
+            as: 'timeline',
+          },
+        },
+
+        // --- latest test result only ---
+        {
+          $lookup: {
+            from: 'testresults',
+            let: { rid: '$_id' },
+            pipeline: [
+              { $match: { $expr: { $eq: ['$runId', '$$rid'] } } },
+              { $sort: { _id: -1 } },
+              { $limit: 1 },
+              { $project: { _id: 0, passed: 1, exitCode: 1, stdout: 1, stderr: 1, durationMs: 1, failedTests: 1, errorSummary: 1, executionMethod: 1 } },
+            ],
+            as: 'latestTestResult',
+          },
+        },
+
+        { $limit: 1 },
+      ]),
     );
 
-    // Timeline entries
-    const { rows: timelineRows } = await query<{
-      iteration: number;
-      result: string;
-      created_at: string;
-      retry_count: number;
-      retry_limit: number;
-    }>(
-      `SELECT iteration, result, created_at, retry_count, retry_limit
-       FROM timeline_entries WHERE run_id = $1 ORDER BY id`,
-      [runId],
-    );
+    dbLog({ level: 'info', operation: 'RunRepository.getFullResult', message: `Aggregation complete for run ${runId}`, durationMs: Date.now() - t0 });
 
-    // Latest test result
-    const { rows: testRows } = await query<{
-      passed: boolean;
-      exit_code: number;
-      stdout: string;
-      stderr: string;
-      duration_ms: number;
-      failed_tests: string[];
-      error_summary: string;
-      execution_method: string;
-    }>(
-      `SELECT passed, exit_code, stdout, stderr, duration_ms,
-              failed_tests, error_summary, execution_method
-       FROM test_results WHERE run_id = $1
-       ORDER BY id DESC LIMIT 1`,
-      [runId],
-    );
+    if (!docs || docs.length === 0) return null;
+    const d = docs[0];
 
-    const testResult = testRows[0] ?? {
-      passed: false,
-      exit_code: -1,
-      stdout: "",
-      stderr: "",
-      duration_ms: 0,
-      failed_tests: [],
-      error_summary: "",
-      execution_method: "skipped",
+    const latestTest = d.latestTestResult?.[0] ?? {
+      passed: false, exitCode: -1, stdout: '', stderr: '',
+      durationMs: 0, failedTests: [], errorSummary: '', executionMethod: 'skipped',
     };
 
     return {
-      executionTime: run.execution_time_s,
-      ciStatus: run.ci_status as RunResult["ciStatus"],
-      failuresCount: run.failures_count,
-      fixesCount: run.fixes_count,
-      commitCount: run.commit_count,
-      fixesTable: patchRows.map((p) => ({
-        filePath: p.file_path,
-        bugType: p.bug_type as RunResult["fixesTable"][number]["bugType"],
-        lineNumber: p.line_number,
+      executionTime: d.executionTimeS,
+      ciStatus: d.ciStatus as RunResult['ciStatus'],
+      failuresCount: d.failuresCount,
+      fixesCount: d.fixesCount,
+      commitCount: d.commitCount,
+      fixesTable: (d.patches as any[]).map((p) => ({
+        filePath: p.filePath,
+        bugType: p.bugType as RunResult['fixesTable'][number]['bugType'],
+        lineNumber: p.lineNumber,
         commitMessage: p.description,
-        status: p.status as "passed" | "failed",
+        status: p.status as 'passed' | 'failed',
       })),
-      timeline: timelineRows.map((t) => ({
+      timeline: (d.timeline as any[]).map((t) => ({
         iteration: t.iteration,
-        result: t.result as "passed" | "failed",
-        timestamp: new Date(t.created_at).toISOString(),
-        retryCount: t.retry_count,
-        retryLimit: t.retry_limit,
+        result: t.result as 'passed' | 'failed',
+        timestamp: new Date(t.createdAt).toISOString(),
+        retryCount: t.retryCount,
+        retryLimit: t.retryLimit,
       })),
-      baseScore: run.base_score,
-      speedBonus: run.speed_bonus,
-      efficiencyPenalty: run.efficiency_penalty,
-      repoUrl: run.repo_url,
-      generatedBranchName: run.branch_name,
-      analysisSummary: run.analysis_summary,
+      baseScore: d.baseScore,
+      speedBonus: d.speedBonus,
+      efficiencyPenalty: d.efficiencyPenalty,
+      repoUrl: d.repoUrl,
+      generatedBranchName: d.branchName,
+      analysisSummary: d.analysisSummary,
       testResults: {
-        passed: testResult.passed,
-        exitCode: testResult.exit_code,
-        stdout: testResult.stdout,
-        stderr: testResult.stderr,
-        durationMs: testResult.duration_ms,
-        failedTests: Array.isArray(testResult.failed_tests)
-          ? testResult.failed_tests
-          : [],
-        errorSummary: testResult.error_summary,
-        executionMethod:
-          testResult.execution_method as RunResult["testResults"]["executionMethod"],
+        passed: latestTest.passed,
+        exitCode: latestTest.exitCode,
+        stdout: latestTest.stdout,
+        stderr: latestTest.stderr,
+        durationMs: latestTest.durationMs,
+        failedTests: Array.isArray(latestTest.failedTests) ? latestTest.failedTests : [],
+        errorSummary: latestTest.errorSummary,
+        executionMethod: latestTest.executionMethod as RunResult['testResults']['executionMethod'],
       },
-      projectType: run.project_type,
-      // Enterprise hardening fields
-      failureCategory: run.failure_category ?? undefined,
-      failureSummary: run.failure_summary ?? undefined,
-      pushStrategy: run.push_strategy ?? undefined,
-      prUrl: run.pr_url ?? undefined,
+      projectType: d.projectType,
+      failureCategory: d.failureCategory,
+      failureSummary: d.failureSummary,
+      pushStrategy: d.pushStrategy,
+      prUrl: d.prUrl,
     };
   },
 
-  /**
-   * List recent runs, most recent first.
-   */
+  /** List most recent runs — excludes large sub-document fields. */
   async listRecent(limit = 50): Promise<RunRecord[]> {
-    const { rows } = await query<RunRow>(
-      `SELECT * FROM runs ORDER BY created_at DESC LIMIT $1`,
-      [limit],
-    );
-    return rows.map(toRunRecord);
+    return withRetry('RunRepository.listRecent', async () => {
+      const runs = await Run.find()
+        .sort({ createdAt: -1 })
+        .limit(limit)
+        .lean<IRun[]>();
+      return runs.map(toRunRecord);
+    });
   },
 };

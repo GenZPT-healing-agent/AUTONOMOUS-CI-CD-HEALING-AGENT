@@ -1,13 +1,16 @@
 /**
- * DiagnosticsRepository — Persist per-iteration remediation diagnostics.
+ * DiagnosticsRepository — Per-iteration remediation intelligence records.
  *
- * Stores: failure classification, strategy result, patch metadata,
- * commit decisions, git push strategy, and PR links.
+ * Two collections (Diagnostic, PatchMetadata) are small per-run documents.
+ * Both are written independently (no transaction needed — neither is critical path).
+ * recordIteration is guarded: it no-ops if all optional data is absent.
  */
 
-import { query } from './db.js';
+import { withRetry, dbLog } from './db.js';
+import { Diagnostic } from './models/Diagnostic.js';
+import { PatchMetadata } from './models/PatchMetadata.js';
 import type { FailureClassification } from '../services/failureClassifier.js';
-import type { PatchMetadata } from '../services/patchGuard.js';
+import type { PatchMetadata as PatchMetaType } from '../services/patchGuard.js';
 import type { StrategyResult } from '../services/remediationStrategies.js';
 import type { CommitDecision } from '../services/commitStrategy.js';
 import type { PushResult } from '../services/gitStrategy.js';
@@ -31,8 +34,10 @@ export interface DiagnosticsEntry {
 }
 
 export const DiagnosticsRepository = {
+
   /**
-   * Record a single iteration's full diagnostics.
+   * Record per-iteration diagnostics.
+   * No-ops if none of the optional data objects are present (avoids empty rows).
    */
   async recordIteration(
     runId: string,
@@ -40,127 +45,105 @@ export const DiagnosticsRepository = {
     data: {
       classification?: FailureClassification;
       strategyResult?: StrategyResult;
-      patchMetadata?: PatchMetadata;
+      patchMetadata?: PatchMetaType;
       commitDecision?: CommitDecision;
       pushResult?: PushResult;
     },
   ): Promise<void> {
     const { classification, strategyResult, patchMetadata, commitDecision, pushResult } = data;
 
+    // Guard: don't insert an empty diagnostic row
+    if (!classification && !strategyResult && !commitDecision && !pushResult) {
+      dbLog({ level: 'warn', operation: 'DiagnosticsRepository.recordIteration', message: `Skipping empty diagnostic for run ${runId} iter ${iteration}` });
+      return;
+    }
+
+    const t0 = Date.now();
     const diffSummary = patchMetadata
       ? `${patchMetadata.filesChanged} files, +${patchMetadata.linesAdded}/-${patchMetadata.linesRemoved} lines`
       : '';
 
-    await query(
-      `INSERT INTO remediation_diagnostics
-         (run_id, iteration, failure_category, failure_summary, confidence,
-          matched_patterns, missing_deps, fault_files, strategy_used,
-          strategy_result, commit_decision, commit_reason, patch_approved,
-          diff_summary, push_strategy, pr_url)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-      [
+    await withRetry('DiagnosticsRepository.recordIteration', () =>
+      Diagnostic.create({
         runId,
         iteration,
-        classification?.category ?? null,
-        classification?.summary ?? '',
-        classification?.confidence ?? 0,
-        JSON.stringify(classification?.matchedPatterns ?? []),
-        JSON.stringify(classification?.missingDependencies ?? []),
-        JSON.stringify(classification?.faultFiles ?? []),
-        strategyResult?.strategy ?? '',
-        strategyResult?.description ?? '',
-        commitDecision?.shouldCommit ? 'COMMIT' : 'WITHHOLD',
-        commitDecision?.reason ?? '',
-        patchMetadata?.approved ?? false,
+        failureCategory: classification?.category,
+        failureSummary: classification?.summary ?? '',
+        confidence: classification?.confidence ?? 0,
+        matchedPatterns: classification?.matchedPatterns ?? [],
+        missingDeps: classification?.missingDependencies ?? [],
+        faultFiles: classification?.faultFiles ?? [],
+        strategyUsed: strategyResult?.strategy ?? '',
+        strategyResult: strategyResult?.description ?? '',
+        commitDecision: commitDecision?.shouldCommit ? 'COMMIT' : 'WITHHOLD',
+        commitReason: commitDecision?.reason ?? '',
+        patchApproved: patchMetadata?.approved ?? false,
         diffSummary,
-        pushResult?.strategy ?? null,
-        pushResult?.prUrl ?? null,
-      ],
+        pushStrategy: pushResult?.strategy ?? null,
+        prUrl: pushResult?.prUrl ?? null,
+      }),
     );
+    dbLog({
+      level: 'info',
+      operation: 'DiagnosticsRepository.recordIteration',
+      message: `Diagnostics recorded for run ${runId} iter ${iteration}`,
+      durationMs: Date.now() - t0,
+    });
   },
 
-  /**
-   * Record patch metadata for an iteration.
-   */
   async recordPatchMetadata(
     runId: string,
     iteration: number,
-    metadata: PatchMetadata,
+    metadata: PatchMetaType,
   ): Promise<void> {
-    await query(
-      `INSERT INTO patch_metadata
-         (run_id, iteration, files_changed, lines_added, lines_removed,
-          total_diff_lines, category_targeted, rationale, approved,
-          rejection_reason, snapshot_sha, changed_file_paths)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)`,
-      [
+    const t0 = Date.now();
+    await withRetry('DiagnosticsRepository.recordPatchMetadata', () =>
+      PatchMetadata.create({
         runId,
         iteration,
-        metadata.filesChanged,
-        metadata.linesAdded,
-        metadata.linesRemoved,
-        metadata.totalDiffLines,
-        metadata.categoryTargeted,
-        metadata.rationale,
-        metadata.approved,
-        metadata.rejectionReason ?? null,
-        metadata.snapshotSha ?? null,
-        JSON.stringify(metadata.changedFilePaths),
-      ],
+        filesChanged: metadata.filesChanged ?? 0,
+        linesAdded: metadata.linesAdded ?? 0,
+        linesRemoved: metadata.linesRemoved ?? 0,
+        totalDiffLines: metadata.totalDiffLines ?? 0,
+        categoryTargeted: metadata.categoryTargeted,
+        rationale: metadata.rationale ?? '',
+        approved: metadata.approved ?? false,
+        rejectionReason: metadata.rejectionReason ?? null,
+        snapshotSha: metadata.snapshotSha ?? null,
+        changedFilePaths: metadata.changedFilePaths ?? [],
+      }),
     );
+    dbLog({
+      level: 'info',
+      operation: 'DiagnosticsRepository.recordPatchMetadata',
+      message: `PatchMetadata recorded for run ${runId} iter ${iteration}`,
+      durationMs: Date.now() - t0,
+    });
   },
 
-  /**
-   * Fetch all diagnostics for a run (for the API).
-   */
   async findByRunId(runId: string): Promise<DiagnosticsEntry[]> {
-    const { rows } = await query<{
-      iteration: number;
-      failure_category: string | null;
-      failure_summary: string;
-      confidence: number;
-      matched_patterns: string[];
-      missing_deps: string[];
-      fault_files: string[];
-      strategy_used: string;
-      strategy_result: string;
-      commit_decision: string;
-      commit_reason: string;
-      patch_approved: boolean;
-      diff_summary: string;
-      push_strategy: string | null;
-      pr_url: string | null;
-    }>(
-      `SELECT iteration, failure_category, failure_summary, confidence,
-              matched_patterns, missing_deps, fault_files, strategy_used,
-              strategy_result, commit_decision, commit_reason, patch_approved,
-              diff_summary, push_strategy, pr_url
-       FROM remediation_diagnostics WHERE run_id = $1 ORDER BY iteration`,
-      [runId],
-    );
-
-    return rows.map(r => ({
-      iteration: r.iteration,
-      failureCategory: r.failure_category ?? 'UNKNOWN_FAILURE',
-      failureSummary: r.failure_summary,
-      confidence: r.confidence,
-      matchedPatterns: Array.isArray(r.matched_patterns) ? r.matched_patterns : [],
-      missingDeps: Array.isArray(r.missing_deps) ? r.missing_deps : [],
-      faultFiles: Array.isArray(r.fault_files) ? r.fault_files : [],
-      strategyUsed: r.strategy_used,
-      strategyResult: r.strategy_result,
-      commitDecision: r.commit_decision,
-      commitReason: r.commit_reason,
-      patchApproved: r.patch_approved,
-      diffSummary: r.diff_summary,
-      pushStrategy: r.push_strategy,
-      prUrl: r.pr_url,
-    }));
+    return withRetry('DiagnosticsRepository.findByRunId', async () => {
+      const rows = await Diagnostic.find({ runId }).sort({ iteration: 1 }).lean();
+      return rows.map((r: any) => ({
+        iteration: r.iteration,
+        failureCategory: r.failureCategory ?? 'UNKNOWN_FAILURE',
+        failureSummary: r.failureSummary,
+        confidence: r.confidence,
+        matchedPatterns: r.matchedPatterns ?? [],
+        missingDeps: r.missingDeps ?? [],
+        faultFiles: r.faultFiles ?? [],
+        strategyUsed: r.strategyUsed,
+        strategyResult: r.strategyResult,
+        commitDecision: r.commitDecision,
+        commitReason: r.commitReason,
+        patchApproved: r.patchApproved,
+        diffSummary: r.diffSummary,
+        pushStrategy: r.pushStrategy ?? null,
+        prUrl: r.prUrl ?? null,
+      }));
+    });
   },
 
-  /**
-   * Fetch patch metadata history for a run.
-   */
   async findPatchMetadataByRunId(runId: string): Promise<Array<{
     iteration: number;
     filesChanged: number;
@@ -169,26 +152,16 @@ export const DiagnosticsRepository = {
     approved: boolean;
     rejectionReason?: string;
   }>> {
-    const { rows } = await query<{
-      iteration: number;
-      files_changed: number;
-      lines_added: number;
-      lines_removed: number;
-      approved: boolean;
-      rejection_reason: string | null;
-    }>(
-      `SELECT iteration, files_changed, lines_added, lines_removed, approved, rejection_reason
-       FROM patch_metadata WHERE run_id = $1 ORDER BY iteration`,
-      [runId],
-    );
-
-    return rows.map(r => ({
-      iteration: r.iteration,
-      filesChanged: r.files_changed,
-      linesAdded: r.lines_added,
-      linesRemoved: r.lines_removed,
-      approved: r.approved,
-      rejectionReason: r.rejection_reason ?? undefined,
-    }));
+    return withRetry('DiagnosticsRepository.findPatchMetadataByRunId', async () => {
+      const rows = await PatchMetadata.find({ runId }).sort({ iteration: 1 }).lean();
+      return rows.map((r: any) => ({
+        iteration: r.iteration,
+        filesChanged: r.filesChanged,
+        linesAdded: r.linesAdded,
+        linesRemoved: r.linesRemoved,
+        approved: r.approved,
+        rejectionReason: r.rejectionReason ?? undefined,
+      }));
+    });
   },
 };

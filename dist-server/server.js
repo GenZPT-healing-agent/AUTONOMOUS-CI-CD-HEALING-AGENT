@@ -4,7 +4,7 @@ import express from "express";
 import { randomUUID } from "node:crypto";
 import { AGENT_PIPELINE } from "./agents/graphAgents.js";
 import { generateBranchName } from "./services/branch.js";
-import { RunRepository, closePool, initPool, isPoolReady, } from "./persistence/index.js";
+import { RunRepository, DiagnosticsRepository, closePool, initPool, isPoolReady, pingDB, } from "./persistence/index.js";
 import { validateRunPayload } from "./services/validatePayload.js";
 import { enqueueRun, remediationQueue } from "./queue/runQueue.js";
 import { remediationWorker } from "./queue/worker.js";
@@ -91,15 +91,18 @@ const clampRetryLimit = (value) => {
 };
 app.get("/api/agent/health", async (_req, res) => {
     try {
-        const { query: dbQuery } = await import("./persistence/db.js");
-        const { rows } = await dbQuery(`SELECT count(*) FROM runs WHERE status = 'running'`);
-        const queueCounts = await remediationQueue.getJobCounts();
+        const [ping, activeRuns, queueCounts] = await Promise.all([
+            pingDB(),
+            RunRepository.countActiveRuns(),
+            remediationQueue.getJobCounts(),
+        ]);
         res.json({
-            status: "ok",
-            persistence: "postgres",
+            status: ping.ok ? "ok" : "degraded",
+            persistence: "mongodb",
             poolReady: isPoolReady(),
+            dbLatencyMs: ping.latencyMs,
             defaultRetryLimit: DEFAULT_RETRY_LIMIT,
-            activeRuns: Number(rows[0]?.count ?? 0),
+            activeRuns,
             queue: {
                 waiting: queueCounts.waiting,
                 active: queueCounts.active,
@@ -118,7 +121,7 @@ app.get("/api/agent/health", async (_req, res) => {
         console.error("[health] DB query failed:", err);
         res.status(503).json({
             status: "error",
-            persistence: "postgres",
+            persistence: "mongodb",
             poolReady: isPoolReady(),
             error: err instanceof Error ? err.message : "Database unreachable",
         });
@@ -170,6 +173,45 @@ app.get("/api/agent/runs/:runId/results", async (req, res) => {
         return;
     }
     res.json(result);
+});
+/* ── Phase 6: Diagnostics API — Structured Observability ── */
+app.get("/api/agent/runs/:runId/diagnostics", async (req, res) => {
+    try {
+        const run = await RunRepository.findById(req.params.runId);
+        if (!run) {
+            res.status(404).json({ error: "Run not found" });
+            return;
+        }
+        const diagnostics = await DiagnosticsRepository.findByRunId(req.params.runId);
+        const patchMetadata = await DiagnosticsRepository.findPatchMetadataByRunId(req.params.runId);
+        // Find final push info from diagnostics
+        const pushDiagnostic = diagnostics.find(d => d.pushStrategy);
+        res.json({
+            runId: req.params.runId,
+            status: run.status,
+            failureCategory: diagnostics[0]?.failureCategory ?? null,
+            remediationAttempts: diagnostics.filter(d => d.iteration > 0 && d.iteration < 100).length,
+            patchMetadata,
+            diagnostics: diagnostics.map(d => ({
+                iteration: d.iteration,
+                failureCategory: d.failureCategory,
+                failureSummary: d.failureSummary,
+                confidence: d.confidence,
+                strategy: d.strategyUsed,
+                strategyResult: d.strategyResult,
+                commitDecision: d.commitDecision,
+                commitReason: d.commitReason,
+                patchApproved: d.patchApproved,
+                diffSummary: d.diffSummary,
+            })),
+            gitStrategy: pushDiagnostic?.pushStrategy ?? null,
+            prUrl: pushDiagnostic?.prUrl ?? null,
+        });
+    }
+    catch (err) {
+        console.error("[diagnostics] Error:", err);
+        res.status(500).json({ error: "Failed to retrieve diagnostics" });
+    }
 });
 /* ── Boot: verify DB then start listening ── */
 const boot = async () => {

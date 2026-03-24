@@ -6,12 +6,11 @@
  */
 
 export {
-  getPool,
-  query,
   withTransaction,
   closePool,
   initPool,
   isPoolReady,
+  pingDB,
 } from "./db.js";
 export { RunRepository } from "./RunRepository.js";
 export { TestResultRepository } from "./TestResultRepository.js";

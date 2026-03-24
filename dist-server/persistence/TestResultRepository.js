@@ -1,77 +1,69 @@
 /**
- * TestResultRepository — Persist real test / build execution results.
+ * TestResultRepository — Full stdout/stderr output for each test execution.
  *
- * Each test execution (baseline and per-iteration verification) is stored
- * as its own row, giving a full audit trail of every test run.
+ * Text fields (stdout, stderr) can be large. They are intentionally stored here
+ * rather than on the Run document to avoid bloating every findById call.
  */
-import { query } from "./db.js";
+import { withRetry, dbLog } from './db.js';
+import { TestResult } from './models/TestResult.js';
 export const TestResultRepository = {
-    /**
-     * Insert a test-execution result tied to a specific run and iteration.
-     *
-     * @param phase  'baseline' for the initial analyzer run,
-     *               'verification' for post-patch verifier runs.
-     */
     async create(runId, iteration, phase, result) {
-        await query(`INSERT INTO test_results
-         (run_id, iteration, phase, passed, exit_code, stdout, stderr,
-          duration_ms, failed_tests, error_summary, execution_method)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`, [
+        const t0 = Date.now();
+        await withRetry('TestResultRepository.create', () => TestResult.create({
             runId,
             iteration,
             phase,
-            result.passed,
-            result.exitCode,
-            result.stdout,
-            result.stderr,
-            result.durationMs,
-            JSON.stringify(result.failedTests),
-            result.errorSummary,
-            result.executionMethod,
-        ]);
+            passed: result.passed,
+            exitCode: result.exitCode,
+            stdout: result.stdout,
+            stderr: result.stderr,
+            durationMs: result.durationMs,
+            failedTests: result.failedTests,
+            errorSummary: result.errorSummary,
+            executionMethod: result.executionMethod,
+        }));
+        dbLog({
+            level: 'info',
+            operation: 'TestResultRepository.create',
+            message: `Stored ${phase} test result for run ${runId} iter ${iteration} (passed=${result.passed})`,
+            durationMs: Date.now() - t0,
+        });
     },
-    /**
-     * Fetch all test results for a run, ordered by iteration.
-     */
     async findByRunId(runId) {
-        const { rows } = await query(`SELECT iteration, phase, passed, exit_code, stdout, stderr,
-              duration_ms, failed_tests, error_summary, execution_method
-       FROM test_results WHERE run_id = $1 ORDER BY id`, [runId]);
-        return rows.map((r) => ({
-            iteration: r.iteration,
-            phase: r.phase,
-            result: {
+        return withRetry('TestResultRepository.findByRunId', async () => {
+            const rows = await TestResult.find({ runId }).sort({ iteration: 1 }).lean();
+            return rows.map((r) => ({
+                iteration: r.iteration,
+                phase: r.phase,
+                result: {
+                    passed: r.passed,
+                    exitCode: r.exitCode,
+                    stdout: r.stdout,
+                    stderr: r.stderr,
+                    durationMs: r.durationMs,
+                    failedTests: r.failedTests ?? [],
+                    errorSummary: r.errorSummary,
+                    executionMethod: r.executionMethod,
+                },
+            }));
+        });
+    },
+    async findLatest(runId) {
+        return withRetry('TestResultRepository.findLatest', async () => {
+            const r = await TestResult.findOne({ runId }).sort({ _id: -1 }).lean();
+            if (!r)
+                return null;
+            return {
                 passed: r.passed,
-                exitCode: r.exit_code,
+                exitCode: r.exitCode,
                 stdout: r.stdout,
                 stderr: r.stderr,
-                durationMs: r.duration_ms,
-                failedTests: Array.isArray(r.failed_tests) ? r.failed_tests : [],
-                errorSummary: r.error_summary,
-                executionMethod: r.execution_method,
-            },
-        }));
-    },
-    /**
-     * Fetch the latest test result for a run.
-     */
-    async findLatest(runId) {
-        const { rows } = await query(`SELECT passed, exit_code, stdout, stderr, duration_ms,
-              failed_tests, error_summary, execution_method
-       FROM test_results WHERE run_id = $1 ORDER BY id DESC LIMIT 1`, [runId]);
-        if (rows.length === 0)
-            return null;
-        const r = rows[0];
-        return {
-            passed: r.passed,
-            exitCode: r.exit_code,
-            stdout: r.stdout,
-            stderr: r.stderr,
-            durationMs: r.duration_ms,
-            failedTests: Array.isArray(r.failed_tests) ? r.failed_tests : [],
-            errorSummary: r.error_summary,
-            executionMethod: r.execution_method,
-        };
+                durationMs: r.durationMs,
+                failedTests: r.failedTests ?? [],
+                errorSummary: r.errorSummary,
+                executionMethod: r.executionMethod,
+            };
+        });
     },
 };
 //# sourceMappingURL=TestResultRepository.js.map

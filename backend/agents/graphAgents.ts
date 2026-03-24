@@ -159,7 +159,6 @@ const analyzerAgent = async (
     analysisSummary,
     failureCategory: classification.category,
     failureSummary: classification.summary,
-    rawStderr: testResults.stderr.slice(0, 10000),
   });
 
   // ── Record baseline diagnostics ──
@@ -427,7 +426,6 @@ const remediationAgent = async (
     testResults: targetedTestResults,
     failureCategory: postPatchClassification.category,
     failureSummary: postPatchClassification.summary,
-    rawStderr: targetedTestResults.stderr,
     prePatChSnapshot: snapshotSha,
     previousFailureCategory: failureCategory,
     ciStatus: targetedTestResults.passed ? "passed" : "failed",

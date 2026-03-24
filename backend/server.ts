@@ -10,6 +10,7 @@ import {
   closePool,
   initPool,
   isPoolReady,
+  pingDB,
 } from "./persistence/index.js";
 import { validateRunPayload } from "./services/validatePayload.js";
 import { enqueueRun, remediationQueue } from "./queue/runQueue.js";
@@ -117,17 +118,18 @@ const clampRetryLimit = (value: unknown): number => {
 
 app.get("/api/agent/health", async (_req, res) => {
   try {
-    const { query: dbQuery } = await import("./persistence/db.js");
-    const { rows } = await dbQuery<{ count: string }>(
-      `SELECT count(*) FROM runs WHERE status = 'running'`,
-    );
-    const queueCounts = await remediationQueue.getJobCounts();
+    const [ping, activeRuns, queueCounts] = await Promise.all([
+      pingDB(),
+      RunRepository.countActiveRuns(),
+      remediationQueue.getJobCounts(),
+    ]);
     res.json({
-      status: "ok",
-      persistence: "postgres",
+      status: ping.ok ? "ok" : "degraded",
+      persistence: "mongodb",
       poolReady: isPoolReady(),
+      dbLatencyMs: ping.latencyMs,
       defaultRetryLimit: DEFAULT_RETRY_LIMIT,
-      activeRuns: Number(rows[0]?.count ?? 0),
+      activeRuns,
       queue: {
         waiting: queueCounts.waiting,
         active: queueCounts.active,
@@ -145,7 +147,7 @@ app.get("/api/agent/health", async (_req, res) => {
     console.error("[health] DB query failed:", err);
     res.status(503).json({
       status: "error",
-      persistence: "postgres",
+      persistence: "mongodb",
       poolReady: isPoolReady(),
       error: err instanceof Error ? err.message : "Database unreachable",
     });

@@ -12,7 +12,7 @@
     "build:client": "vite build",
     "preview": "vite preview",
     "start": "node dist/backend/server.js",
-    "db:migrate": "psql \"$DATABASE_URL\" -f backend/persistence/migrations/001_initial_schema.sql"
+    "db:migrate": "psql $env:DATABASE_URL -f backend/persistence/migrations/001_initial_schema.sql"
   },
   "dependencies": {
     "@langchain/langgraph": "^0.2.74",
@@ -26,7 +26,8 @@
     "framer-motion": "^11.18.2",
     "gsap": "^3.12.7",
     "lenis": "^1.1.18",
-    "pg": "^8.18.0",
+    "mongodb": "^7.1.0",
+    "mongoose": "^9.3.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-router-dom": "^6.30.1",
@@ -38,7 +39,6 @@
     "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
     "@types/node": "^22.10.2",
-    "@types/pg": "^8.16.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
     "@vitejs/plugin-react": "^4.3.3",

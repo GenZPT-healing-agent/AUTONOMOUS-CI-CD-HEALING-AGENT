@@ -1,71 +1,70 @@
 /**
- * PatchRepository — Persist individual patch / fix records and timeline entries.
+ * PatchRepository — Persist file patches and per-iteration timeline entries.
  *
- * Each patch (file mutation) applied during remediation is recorded here,
- * along with the per-iteration timeline that the dashboard renders.
+ * Patches + timeline are written atomically in a single transaction per iteration
+ * because both documents are semantically part of the same remediation event.
  */
-import { query, withTransaction } from "./db.js";
+import { withTransaction, withRetry, dbLog } from './db.js';
+import { Patch } from './models/Patch.js';
+import { TimelineEntry } from './models/TimelineEntry.js';
 export const PatchRepository = {
     /**
-     * Bulk-insert patches for a single remediation iteration.
-     * Also inserts the corresponding timeline entry atomically.
+     * Atomically insert patches + a timeline entry for one remediation iteration.
+     * Transaction is justified: both documents represent the same discrete event.
      */
     async recordIteration(runId, iteration, patches, timelineEntry, commitSha) {
-        await withTransaction(async (client) => {
-            // Insert patches
-            for (const p of patches) {
-                await client.query(`INSERT INTO patches
-             (run_id, iteration, file_path, bug_type, line_number, description, status, commit_sha)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, [
+        const t0 = Date.now();
+        await withRetry('PatchRepository.recordIteration', () => withTransaction(async (session) => {
+            if (patches.length > 0) {
+                await Patch.insertMany(patches.map((p) => ({
                     runId,
                     iteration,
-                    p.filePath,
-                    p.bugType,
-                    p.lineNumber,
-                    p.commitMessage,
-                    p.status,
-                    commitSha ?? null,
-                ]);
+                    filePath: p.filePath,
+                    bugType: p.bugType,
+                    lineNumber: p.lineNumber,
+                    description: p.commitMessage,
+                    status: p.status,
+                    commitSha,
+                })), { session });
             }
-            // Insert timeline entry
-            await client.query(`INSERT INTO timeline_entries
-           (run_id, iteration, result, retry_count, retry_limit)
-         VALUES ($1, $2, $3, $4, $5)`, [
-                runId,
-                timelineEntry.iteration,
-                timelineEntry.result,
-                timelineEntry.retryCount,
-                timelineEntry.retryLimit,
-            ]);
+            await TimelineEntry.create([{
+                    runId,
+                    iteration: timelineEntry.iteration,
+                    result: timelineEntry.result,
+                    retryCount: timelineEntry.retryCount,
+                    retryLimit: timelineEntry.retryLimit,
+                }], { session });
+        }));
+        dbLog({
+            level: 'info',
+            operation: 'PatchRepository.recordIteration',
+            message: `Recorded ${patches.length} patch(es) + timeline for run ${runId} iter ${iteration}`,
+            durationMs: Date.now() - t0,
         });
     },
-    /**
-     * Fetch all patches for a run.
-     */
     async findByRunId(runId) {
-        const { rows } = await query(`SELECT file_path, bug_type, line_number, description, status
-       FROM patches WHERE run_id = $1 ORDER BY id`, [runId]);
-        return rows.map((r) => ({
-            filePath: r.file_path,
-            bugType: r.bug_type,
-            lineNumber: r.line_number,
-            commitMessage: r.description,
-            status: r.status,
-        }));
+        return withRetry('PatchRepository.findByRunId', async () => {
+            const rows = await Patch.find({ runId }).sort({ iteration: 1 }).lean();
+            return rows.map((p) => ({
+                filePath: p.filePath,
+                bugType: p.bugType,
+                lineNumber: p.lineNumber,
+                commitMessage: p.description,
+                status: p.status,
+            }));
+        });
     },
-    /**
-     * Fetch all timeline entries for a run.
-     */
     async findTimelineByRunId(runId) {
-        const { rows } = await query(`SELECT iteration, result, created_at, retry_count, retry_limit
-       FROM timeline_entries WHERE run_id = $1 ORDER BY id`, [runId]);
-        return rows.map((r) => ({
-            iteration: r.iteration,
-            result: r.result,
-            timestamp: new Date(r.created_at).toISOString(),
-            retryCount: r.retry_count,
-            retryLimit: r.retry_limit,
-        }));
+        return withRetry('PatchRepository.findTimelineByRunId', async () => {
+            const rows = await TimelineEntry.find({ runId }).sort({ iteration: 1 }).lean();
+            return rows.map((r) => ({
+                iteration: r.iteration,
+                result: r.result,
+                timestamp: r.createdAt.toISOString(),
+                retryCount: r.retryCount,
+                retryLimit: r.retryLimit,
+            }));
+        });
     },
 };
 //# sourceMappingURL=PatchRepository.js.map

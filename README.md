@@ -68,6 +68,13 @@ AGENT_RETRY_LIMIT=5
 GITHUB_TOKEN=<your_github_token>
 SANDBOX_ALLOW_MOCK=true
 
+# PostgreSQL connection string (Supabase or any Postgres 14+)
+DATABASE_URL=postgresql://postgres:[PASSWORD]@localhost:5432/postgres
+DB_SSL=false
+
+# Redis connection string for BullMQ job queue
+REDIS_URL=redis://localhost:6379
+
 # Optional: when hosting frontend separately from backend.
 # VITE_API_BASE_URL=https://your-backend.example.com
 ```
@@ -76,12 +83,22 @@ Prerequisites:
 
 - Node.js 18+
 - npm 9+
+- PostgreSQL 14+ (or compatible e.g. Supabase)
+- Redis (for BullMQ job queue)
 - Docker installed and running
 - GitHub token with permission to trigger workflow dispatch (for sandbox execution)
 
 ## Usage Examples
 
 ### Start development servers
+
+First, run database migrations (requires `psql` CLI or handled via your Postgres provider):
+
+```bash
+npm run db:migrate
+```
+
+Then, start the servers:
 
 ```bash
 npm run dev
@@ -127,7 +144,7 @@ Based on generated run artifacts (`runs/*/results.json`), current bug categories
 ## Tech Stack
 
 - Frontend: React, Vite, Tailwind CSS, Framer Motion, Recharts
-- Backend: Node.js, Express, TypeScript (`tsx` runtime)
+- Backend: Node.js, Express, TypeScript (`tsx` runtime), PostgreSQL, Redis/BullMQ
 - Orchestration/AI: LangGraph (`@langchain/langgraph`)
 - State and tooling: Zustand, Concurrently, PostCSS
 - Runtime dependencies: Docker sandbox + GitHub workflow dispatch integration

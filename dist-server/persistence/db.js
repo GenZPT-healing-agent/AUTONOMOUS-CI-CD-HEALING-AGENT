@@ -1,192 +1,171 @@
 /**
- * db.ts — PostgreSQL connection pool.
+ * db.ts — MongoDB connection manager (Mongoose).
  *
- * Single pooled connection via `pg.Pool`, configured from DATABASE_URL.
- * Provides query helpers and clean shutdown for graceful process termination.
+ * Production-grade features:
+ *  • Atlas-tuned connection options
+ *  • Automatic reconnection listeners
+ *  • Exponential back-off retry utility (withRetry)
+ *  • Structured logging helper (dbLog)
+ *  • Health-check ping
  */
-import pg from "pg";
-const { Pool } = pg;
-/* ── Pool singleton ── */
-let pool = null;
+import mongoose from 'mongoose';
+/* ── Internal state ── */
 let poolReady = false;
-/**
- * Parse DATABASE_URL and log redacted connection parameters for diagnostics.
- */
-const logConnectionParams = (connectionString) => {
-    try {
-        const url = new URL(connectionString);
-        const redactedPassword = url.password
-            ? `${url.password.slice(0, 3)}***${url.password.slice(-2)}`
-            : "(empty)";
-        console.log("[db] Connection parameters:");
-        console.log(`  host     : ${url.hostname}`);
-        console.log(`  port     : ${url.port || "(default)"}`);
-        console.log(`  database : ${url.pathname.replace("/", "")}`);
-        console.log(`  user     : ${url.username}`);
-        console.log(`  password : ${redactedPassword} (length=${url.password.length})`);
-        console.log(`  params   : ${url.searchParams.toString() || "(none)"}`);
-        // Warn about common Supabase pooler issues
-        const port = parseInt(url.port, 10);
-        if (port === 5432) {
-            console.warn("[db] WARNING: Port 5432 is the direct connection port. " +
-                "Supabase connection pooler typically uses port 6543. " +
-                "If you see IPv6/ENETUNREACH errors, switch to the pooler URL.");
-        }
-        if (url.password.endsWith(" ") || url.password.startsWith(" ")) {
-            console.error("[db] ERROR: DATABASE_URL password has leading/trailing whitespace!");
-        }
-        if (connectionString.endsWith(" ") || connectionString.endsWith("\n")) {
-            console.error("[db] ERROR: DATABASE_URL has trailing whitespace or newline!");
-        }
-    }
-    catch (e) {
-        console.error("[db] Failed to parse DATABASE_URL:", e instanceof Error ? e.message : e);
-    }
+export const dbLog = (entry) => {
+    const parts = [
+        `[db]`,
+        `[${entry.level.toUpperCase()}]`,
+        `op=${entry.operation}`,
+        entry.message,
+    ];
+    if (entry.durationMs !== undefined)
+        parts.push(`duration=${entry.durationMs}ms`);
+    if (entry.error)
+        parts.push(`error="${entry.error}"`);
+    const line = parts.join(' ');
+    if (entry.level === 'error')
+        console.error(line);
+    else if (entry.level === 'warn')
+        console.warn(line);
+    else
+        console.log(line);
 };
-/**
- * Categorise a connection error for actionable diagnostics.
- */
-const categoriseError = (err) => {
+/* ── Retry utility ── */
+const RETRIABLE_CODES = new Set([
+    'ETIMEDOUT',
+    'ECONNRESET',
+    'ECONNREFUSED',
+    'MongoNetworkError',
+    'MongoServerSelectionError',
+]);
+const isRetriable = (err) => {
     if (!(err instanceof Error))
-        return "unknown";
-    const msg = err.message.toLowerCase();
-    const code = err.code?.toLowerCase() ?? "";
-    if (code === "enetunreach" || msg.includes("enetunreach"))
-        return "NETWORK_UNREACHABLE (IPv6 blocked — use Supabase pooler URL on port 6543)";
-    if (code === "enotfound" || msg.includes("enotfound"))
-        return "DNS_RESOLUTION_FAILED (hostname cannot be resolved)";
-    if (code === "econnrefused" || msg.includes("econnrefused"))
-        return "CONNECTION_REFUSED (host reachable but port closed)";
-    if (code === "econnreset" || msg.includes("econnreset"))
-        return "CONNECTION_RESET (connection dropped — possible SSL/firewall issue)";
-    if (msg.includes("timeout"))
-        return "TIMEOUT (connection attempt exceeded deadline — check host/port/firewall)";
-    if (msg.includes("ssl") || msg.includes("tls") || msg.includes("certificate"))
-        return "SSL_HANDSHAKE (SSL/TLS negotiation failed)";
-    if (msg.includes("password") ||
-        msg.includes("authentication") ||
-        msg.includes("28p01"))
-        return "AUTH_FAILURE (invalid credentials)";
-    if (msg.includes("no pg_hba.conf"))
-        return "AUTH_FAILURE (IP not allowed in pg_hba.conf)";
-    if (msg.includes("remaining connection slots"))
-        return "POOL_EXHAUSTED (too many connections)";
-    return `UNCATEGORISED (code=${code})`;
+        return false;
+    const name = err.name ?? '';
+    const code = err.code ?? '';
+    return (RETRIABLE_CODES.has(name) ||
+        RETRIABLE_CODES.has(code) ||
+        err.message.toLowerCase().includes('topology') ||
+        err.message.toLowerCase().includes('timed out'));
 };
 /**
- * Return (or create) the shared connection pool.
- * Uses DATABASE_URL from the environment.  Supabase provides this natively.
+ * Retry a DB operation up to `maxAttempts` times with exponential back-off.
+ * Only retries on network-level / transient errors.
  */
-export const getPool = () => {
-    if (pool)
-        return pool;
+export const withRetry = async (operation, fn, maxAttempts = 3) => {
+    let lastErr;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await fn();
+        }
+        catch (err) {
+            lastErr = err;
+            if (!isRetriable(err) || attempt === maxAttempts)
+                throw err;
+            const delay = Math.min(200 * Math.pow(2, attempt - 1), 3000); // 200 ms → 400 → 800 → clamp 3 s
+            dbLog({
+                level: 'warn',
+                operation,
+                message: `Transient error on attempt ${attempt}/${maxAttempts}, retrying in ${delay}ms`,
+                error: err instanceof Error ? err.message : String(err),
+            });
+            await new Promise((r) => setTimeout(r, delay));
+        }
+    }
+    throw lastErr;
+};
+/* ── Connection lifecycle ── */
+export const initPool = async () => {
     const connectionString = process.env.DATABASE_URL;
     if (!connectionString) {
-        throw new Error("DATABASE_URL is not set. " +
-            "Provide a PostgreSQL connection string (e.g. from Supabase) in your .env file.");
+        throw new Error('DATABASE_URL is not set. Provide a MongoDB Atlas connection string in your .env file.');
     }
-    logConnectionParams(connectionString);
-    const sslConfig = process.env.DB_SSL === "false" ? false : { rejectUnauthorized: false };
-    console.log(`[db] SSL mode: ${process.env.DB_SSL === "false" ? "disabled (DB_SSL=false)" : "enabled (rejectUnauthorized=false)"}`);
-    pool = new Pool({
-        connectionString,
-        max: 10,
-        idleTimeoutMillis: 30_000,
-        connectionTimeoutMillis: 15_000, // 15 s — generous for cold starts
-        ssl: sslConfig,
-    });
-    pool.on("error", (err) => {
-        console.error("[db] Unexpected pool error:", err.message);
-        console.error("[db] Error category:", categoriseError(err));
-    });
-    console.log("[db] Connection pool created");
-    return pool;
-};
-/**
- * Perform an immediate connection test.
- * Must be called after getPool(). Throws on failure.
- */
-export const initPool = async () => {
-    const p = getPool();
-    console.log("[db] Testing database connection…");
-    const start = Date.now();
-    let client;
     try {
-        client = await p.connect();
-        const result = await client.query("SELECT 1 AS connection_test");
-        const elapsed = Date.now() - start;
-        if (result.rows[0]?.connection_test === 1) {
-            console.log(`[db] ✓ Connection verified successfully (${elapsed}ms)`);
-            poolReady = true;
-        }
-        else {
-            throw new Error("SELECT 1 returned unexpected result: " + JSON.stringify(result.rows));
-        }
+        const url = new URL(connectionString);
+        dbLog({ level: 'info', operation: 'init', message: `Connecting to host=${url.hostname} db=${url.pathname.replace('/', '')} user=${url.username}` });
+    }
+    catch {
+        // URI not parseable — log anyway
+        dbLog({ level: 'info', operation: 'init', message: 'Connecting to MongoDB…' });
+    }
+    /* Wire up connection events before calling connect() */
+    mongoose.connection.on('connected', () => {
+        poolReady = true;
+        dbLog({ level: 'info', operation: 'lifecycle', message: '✓ Connected' });
+    });
+    mongoose.connection.on('reconnected', () => {
+        poolReady = true;
+        dbLog({ level: 'info', operation: 'lifecycle', message: '↺ Reconnected' });
+    });
+    mongoose.connection.on('disconnected', () => {
+        poolReady = false;
+        dbLog({ level: 'warn', operation: 'lifecycle', message: '⚡ Disconnected from MongoDB' });
+    });
+    mongoose.connection.on('error', (err) => {
+        dbLog({ level: 'error', operation: 'lifecycle', message: 'Connection error', error: err.message });
+    });
+    try {
+        await mongoose.connect(connectionString, {
+            // Pool sizing
+            minPoolSize: 2,
+            maxPoolSize: 10,
+            // Timeouts tuned for Atlas (TLS handshake + network latency)
+            serverSelectionTimeoutMS: 15_000,
+            connectTimeoutMS: 15_000,
+            socketTimeoutMS: 45_000,
+            // Allow Atlas rolling restarts without hard-crash
+            heartbeatFrequencyMS: 10_000,
+        });
+        poolReady = true;
+        dbLog({ level: 'info', operation: 'init', message: '✓ Connection pool ready' });
     }
     catch (err) {
-        const elapsed = Date.now() - start;
-        const category = categoriseError(err);
-        console.error(`[db] ✗ Connection FAILED after ${elapsed}ms`);
-        console.error(`[db] Error category: ${category}`);
-        if (err instanceof Error) {
-            console.error(`[db] Message: ${err.message}`);
-            console.error(`[db] Code: ${err.code ?? "N/A"}`);
-            console.error(`[db] Errno: ${err.errno ?? "N/A"}`);
-            console.error(`[db] Stack:\n${err.stack}`);
-        }
-        else {
-            console.error("[db] Error object:", err);
-        }
+        dbLog({
+            level: 'error',
+            operation: 'init',
+            message: '✗ Connection FAILED',
+            error: err instanceof Error ? err.message : String(err),
+        });
         throw err;
     }
-    finally {
-        if (client)
-            client.release();
+};
+export const isPoolReady = () => poolReady && mongoose.connection.readyState === 1;
+/** Quick round-trip ping — used by the health-check route. */
+export const pingDB = async () => {
+    const t0 = Date.now();
+    try {
+        await mongoose.connection.db.command({ ping: 1 });
+        return { ok: true, latencyMs: Date.now() - t0 };
+    }
+    catch {
+        return { ok: false, latencyMs: Date.now() - t0 };
     }
 };
-/**
- * Whether the pool has passed the startup connection test.
- */
-export const isPoolReady = () => poolReady;
-/**
- * Execute a parameterised query against the pool.
- * Always use $1, $2, … placeholders — never interpolate user input.
- */
-export const query = async (text, params) => {
-    const client = getPool();
-    const result = await client.query(text, params);
-    return { rows: result.rows, rowCount: result.rowCount };
+export const closePool = async () => {
+    dbLog({ level: 'info', operation: 'shutdown', message: 'Closing MongoDB connection pool…' });
+    await mongoose.disconnect();
+    dbLog({ level: 'info', operation: 'shutdown', message: 'Pool closed' });
 };
+/* ── Transaction helper ── */
 /**
- * Run a callback inside a database transaction.
- * The transaction is committed on success, rolled back on error.
+ * Execute a callback inside a MongoDB multi-document transaction.
+ * Atlas replica sets support transactions natively.
+ * Sessions are always cleaned up in the `finally` block.
  */
 export const withTransaction = async (fn) => {
-    const client = await getPool().connect();
+    const session = await mongoose.startSession();
     try {
-        await client.query("BEGIN");
-        const result = await fn(client);
-        await client.query("COMMIT");
+        session.startTransaction();
+        const result = await fn(session);
+        await session.commitTransaction();
         return result;
     }
     catch (err) {
-        await client.query("ROLLBACK");
+        await session.abortTransaction();
         throw err;
     }
     finally {
-        client.release();
+        session.endSession();
     }
-};
-/* ── Lifecycle ── */
-/**
- * Gracefully close the pool.  Call this on SIGTERM / SIGINT.
- */
-export const closePool = async () => {
-    if (!pool)
-        return;
-    console.log("[db] Draining connection pool…");
-    await pool.end();
-    pool = null;
-    console.log("[db] Pool closed");
 };
 //# sourceMappingURL=db.js.map

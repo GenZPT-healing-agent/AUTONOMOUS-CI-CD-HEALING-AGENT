@@ -11,6 +11,8 @@ import { NeuralLoader } from "./components/NeuralLoader";
 import { CursorHalo } from "./components/motion/CursorHalo";
 import { GlowPulse } from "./components/motion/GlowPulse";
 import { Reveal, Stagger } from "./components/motion/Reveal";
+import { LandingPage } from "./pages/LandingPage";
+import { Navigation } from "./components/Navigation";
 
 import { useDashboardStore } from "./store/dashboardStore";
 import { useMousePosition } from "./hooks/useMousePosition";
@@ -62,136 +64,235 @@ function App() {
       {/* Cursor halo effect */}
       <CursorHalo />
 
-      {/* Main content */}
-      <div className="relative z-10 px-4 py-8 sm:px-6 lg:px-8">
-        <div className="mx-auto max-w-7xl space-y-6">
-          {/* Header */}
-          <Reveal variant="fadeSlideUp">
-            <header className="glass-card relative overflow-hidden p-6 sm:p-8">
-              {/* Animated gradient stripe */}
+      {/* Routes */}
+      <AnimatePresence mode="wait">
+        <Routes location={location} key={location.pathname}>
+          <Route
+            path="/"
+            element={
               <motion.div
-                className="absolute top-0 left-0 right-0 h-[2px]"
-                style={{
-                  background:
-                    "linear-gradient(90deg, transparent, #00FF7F, #00E5FF, transparent)",
-                  backgroundSize: "200% 100%",
-                }}
-                animate={{ backgroundPosition: ["0% 50%", "200% 50%"] }}
-                transition={{ duration: 3, repeat: Infinity, ease: "linear" }}
-              />
-
-              <div className="relative flex items-start justify-between">
-                <div>
-                  <div className="flex items-center gap-2 mb-2">
-                    <GlowPulse size={6} />
-                    <span className="label-cyber">System Online</span>
-                  </div>
-                  <h1 className="text-2xl sm:text-3xl lg:text-4xl font-bold">
-                    <span className="heading-gradient">Autonomous CI/CD</span>
-                    <br />
-                    <span className="text-white/80 text-xl sm:text-2xl lg:text-3xl">
-                      Healing Agent
-                    </span>
-                  </h1>
-                  <p className="mt-3 max-w-2xl text-sm text-white/40 leading-relaxed">
-                    Real-time autonomous remediation engine — analyzes, patches,
-                    and verifies pipeline failures.
-                  </p>
-                </div>
-
-                {/* Status indicator */}
-                <div className="hidden sm:flex flex-col items-end gap-2">
-                  <div className="flex items-center gap-2 text-[10px] text-white/25 uppercase tracking-widest">
-                    <span>Agent Status</span>
-                    <GlowPulse
-                      size={5}
-                      color={
-                        execution.status === "running"
-                          ? "#FFBD2E"
-                          : execution.status === "success"
-                            ? "#00FF7F"
-                            : execution.status === "failed"
-                              ? "#FF4757"
-                              : "#94A3B8"
-                      }
-                    />
-                  </div>
-                  <span className="font-mono text-[11px] text-white/20">
-                    v2.0.0 &middot; neural-engine
-                  </span>
-                </div>
-              </div>
-            </header>
-          </Reveal>
-
-          {/* Error banner */}
-          <AnimatePresence>
-            {errorMessage && (
-              <motion.div
-                initial={{ opacity: 0, y: -10, height: 0 }}
-                animate={{ opacity: 1, y: 0, height: "auto" }}
-                exit={{ opacity: 0, y: -10, height: 0 }}
-                className="rounded-xl border border-red-500/30 bg-red-500/10 backdrop-blur-sm px-5 py-3 text-sm text-red-300"
-                style={{ boxShadow: "0 0 30px rgba(255, 71, 87, 0.1)" }}
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                transition={{ duration: 0.5 }}
               >
-                <span className="text-red-400 mr-2 font-mono text-xs">
-                  [ERROR]
-                </span>
-                {errorMessage}
+                <LandingPage />
               </motion.div>
-            )}
-          </AnimatePresence>
+            }
+          />
+          <Route
+            path="/terminal"
+            element={
+              <>
+                <Navigation />
+                <div className="relative z-10 px-4 py-8 sm:px-6 lg:px-8">
+                  <div className="mx-auto max-w-7xl space-y-6">
+                    {/* Header */}
+                    <Reveal variant="fadeSlideUp">
+                      <header className="glass-card relative overflow-hidden p-6 sm:p-8">
+                        {/* Animated gradient stripe */}
+                        <motion.div
+                          className="absolute top-0 left-0 right-0 h-[2px]"
+                          style={{
+                            background:
+                              "linear-gradient(90deg, transparent, #00FF7F, #00E5FF, transparent)",
+                            backgroundSize: "200% 100%",
+                          }}
+                          animate={{ backgroundPosition: ["0% 50%", "200% 50%"] }}
+                          transition={{ duration: 3, repeat: Infinity, ease: "linear" }}
+                        />
 
-          {/* Routes */}
-          <AnimatePresence mode="wait">
-            <Routes location={location} key={location.pathname}>
-              <Route
-                path="/"
-                element={
-                  <motion.div
-                    initial={{ opacity: 0 }}
-                    animate={{ opacity: 1 }}
-                    exit={{ opacity: 0, y: -20 }}
-                    transition={{ duration: 0.4 }}
-                  >
-                    <TerminalInfoSection />
-                  </motion.div>
-                }
-              />
-              <Route
-                path="/dashboard"
-                element={
-                  isDashboardPage ? (
+                        <div className="relative flex items-start justify-between">
+                          <div>
+                            <div className="flex items-center gap-2 mb-2">
+                              <GlowPulse size={6} />
+                              <span className="label-cyber">System Online</span>
+                            </div>
+                            <h1 className="text-2xl sm:text-3xl lg:text-4xl font-bold">
+                              <span className="heading-gradient">Autonomous CI/CD</span>
+                              <br />
+                              <span className="text-white/80 text-xl sm:text-2xl lg:text-3xl">
+                                Healing Agent
+                              </span>
+                            </h1>
+                            <p className="mt-3 max-w-2xl text-sm text-white/40 leading-relaxed">
+                              Real-time autonomous remediation engine — analyzes, patches,
+                              and verifies pipeline failures.
+                            </p>
+                          </div>
+
+                          {/* Status indicator */}
+                          <div className="hidden sm:flex flex-col items-end gap-2">
+                            <div className="flex items-center gap-2 text-[10px] text-white/25 uppercase tracking-widest">
+                              <span>Agent Status</span>
+                              <GlowPulse
+                                size={5}
+                                color={
+                                  execution.status === "running"
+                                    ? "#FFBD2E"
+                                    : execution.status === "success"
+                                      ? "#00FF7F"
+                                      : execution.status === "failed"
+                                        ? "#FF4757"
+                                        : "#94A3B8"
+                                }
+                              />
+                            </div>
+                            <span className="font-mono text-[11px] text-white/20">
+                              v2.0.0 &middot; neural-engine
+                            </span>
+                          </div>
+                        </div>
+                      </header>
+                    </Reveal>
+
+                    {/* Error banner */}
+                    <AnimatePresence>
+                      {errorMessage && (
+                        <motion.div
+                          initial={{ opacity: 0, y: -10, height: 0 }}
+                          animate={{ opacity: 1, y: 0, height: "auto" }}
+                          exit={{ opacity: 0, y: -10, height: 0 }}
+                          className="rounded-xl border border-red-500/30 bg-red-500/10 backdrop-blur-sm px-5 py-3 text-sm text-red-300"
+                          style={{ boxShadow: "0 0 30px rgba(255, 71, 87, 0.1)" }}
+                        >
+                          <span className="text-red-400 mr-2 font-mono text-xs">
+                            [ERROR]
+                          </span>
+                          {errorMessage}
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+
                     <motion.div
                       initial={{ opacity: 0 }}
                       animate={{ opacity: 1 }}
-                      exit={{ opacity: 0 }}
-                      transition={{ duration: 0.5 }}
+                      exit={{ opacity: 0, y: -20 }}
+                      transition={{ duration: 0.4 }}
                     >
-                      <DashboardView
-                        runStatus={runStatus}
-                        metadata={metadata}
-                        execution={execution}
-                        failureLines={failureLines}
-                        tableRows={tableRows}
-                        results={results}
-                      />
+                      <TerminalInfoSection />
                     </motion.div>
-                  ) : (
-                    <Navigate to="/" replace />
-                  )
-                }
-              />
-              <Route
-                path="*"
-                element={
-                  <Navigate to={isDashboardPage ? "/dashboard" : "/"} replace />
-                }
-              />
-            </Routes>
-          </AnimatePresence>
-        </div>
-      </div>
+                  </div>
+                </div>
+              </>
+            }
+          />
+          <Route
+            path="/dashboard"
+            element={
+              isDashboardPage ? (
+                <>
+                  <Navigation />
+                  <div className="relative z-10 px-4 py-8 sm:px-6 lg:px-8">
+                    <div className="mx-auto max-w-7xl space-y-6">
+                      {/* Header */}
+                      <Reveal variant="fadeSlideUp">
+                        <header className="glass-card relative overflow-hidden p-6 sm:p-8">
+                          {/* Animated gradient stripe */}
+                          <motion.div
+                            className="absolute top-0 left-0 right-0 h-[2px]"
+                            style={{
+                              background:
+                                "linear-gradient(90deg, transparent, #00FF7F, #00E5FF, transparent)",
+                              backgroundSize: "200% 100%",
+                            }}
+                            animate={{ backgroundPosition: ["0% 50%", "200% 50%"] }}
+                            transition={{ duration: 3, repeat: Infinity, ease: "linear" }}
+                          />
+
+                          <div className="relative flex items-start justify-between">
+                            <div>
+                              <div className="flex items-center gap-2 mb-2">
+                                <GlowPulse size={6} />
+                                <span className="label-cyber">System Online</span>
+                              </div>
+                              <h1 className="text-2xl sm:text-3xl lg:text-4xl font-bold">
+                                <span className="heading-gradient">Autonomous CI/CD</span>
+                                <br />
+                                <span className="text-white/80 text-xl sm:text-2xl lg:text-3xl">
+                                  Healing Agent
+                                </span>
+                              </h1>
+                              <p className="mt-3 max-w-2xl text-sm text-white/40 leading-relaxed">
+                                Real-time autonomous remediation engine — analyzes, patches,
+                                and verifies pipeline failures.
+                              </p>
+                            </div>
+
+                            {/* Status indicator */}
+                            <div className="hidden sm:flex flex-col items-end gap-2">
+                              <div className="flex items-center gap-2 text-[10px] text-white/25 uppercase tracking-widest">
+                                <span>Agent Status</span>
+                                <GlowPulse
+                                  size={5}
+                                  color={
+                                    execution.status === "running"
+                                      ? "#FFBD2E"
+                                      : execution.status === "success"
+                                        ? "#00FF7F"
+                                        : execution.status === "failed"
+                                          ? "#FF4757"
+                                          : "#94A3B8"
+                                  }
+                                />
+                              </div>
+                              <span className="font-mono text-[11px] text-white/20">
+                                v2.0.0 &middot; neural-engine
+                              </span>
+                            </div>
+                          </div>
+                        </header>
+                      </Reveal>
+
+                      {/* Error banner */}
+                      <AnimatePresence>
+                        {errorMessage && (
+                          <motion.div
+                            initial={{ opacity: 0, y: -10, height: 0 }}
+                            animate={{ opacity: 1, y: 0, height: "auto" }}
+                            exit={{ opacity: 0, y: -10, height: 0 }}
+                            className="rounded-xl border border-red-500/30 bg-red-500/10 backdrop-blur-sm px-5 py-3 text-sm text-red-300"
+                            style={{ boxShadow: "0 0 30px rgba(255, 71, 87, 0.1)" }}
+                          >
+                            <span className="text-red-400 mr-2 font-mono text-xs">
+                              [ERROR]
+                            </span>
+                            {errorMessage}
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+
+                      <motion.div
+                        initial={{ opacity: 0 }}
+                        animate={{ opacity: 1 }}
+                        exit={{ opacity: 0 }}
+                        transition={{ duration: 0.5 }}
+                      >
+                        <DashboardView
+                          runStatus={runStatus}
+                          metadata={metadata}
+                          execution={execution}
+                          failureLines={failureLines}
+                          tableRows={tableRows}
+                          results={results}
+                        />
+                      </motion.div>
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <Navigate to="/terminal" replace />
+              )
+            }
+          />
+          <Route
+            path="*"
+            element={
+              <Navigate to={isDashboardPage ? "/dashboard" : "/"} replace />
+            }
+          />
+        </Routes>
+      </AnimatePresence>
 
       {/* Loading overlay */}
       <AnimatePresence>
