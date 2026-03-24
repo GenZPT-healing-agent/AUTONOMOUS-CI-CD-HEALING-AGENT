@@ -1,4 +1,0 @@
-
-> autonomous-devops-agent-dashboard@1.0.0 build:server
-> tsc -p tsconfig.server.json
-
